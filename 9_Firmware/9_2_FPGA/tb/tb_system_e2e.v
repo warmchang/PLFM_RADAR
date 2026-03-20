@@ -23,6 +23,7 @@
  *   G11: Processing Latency Budgets (2 checks)
  *   G12: Watchdog / Liveness (2 checks)
  *   G13: Doppler/Chirps Mismatch Protection (8 checks) [Fix 4]
+ *   G14: CFAR Configuration Registers (13 checks) [CFAR integration]
  *
  * Compile:
  *   iverilog -g2001 -DSIMULATION -o tb/tb_system_e2e.vvp \
@@ -1036,6 +1037,94 @@ initial begin
     bfm_send_cmd(8'h15, 8'h00, 16'd32);
     check(dut.chirps_mismatch_error == 1'b0,
           "G13.8: Mismatch error clears when restored to 32");
+
+    $display("");
+
+    // ================================================================
+    // GROUP 14: CFAR CONFIGURATION REGISTERS (CFAR integration)
+    // ================================================================
+    $display("--- Group 14: CFAR Configuration Registers ---");
+
+    // G14.1: Verify CFAR defaults after reset (we did a mid-test reset in G9)
+    // The registers were re-loaded in G9. Send fresh values to verify write path.
+
+    // --- Range Mode Register (0x20, Fix 7) ---
+    // G14.1: Set range_mode to short-range (0x01)
+    bfm_send_cmd(8'h20, 8'h00, 16'h0001);
+    check(dut.host_range_mode == 2'b01,
+          "G14.1: Opcode 0x20 -> host_range_mode = 2'b01 (short)");
+
+    // G14.2: Set range_mode to long-range (0x02)
+    bfm_send_cmd(8'h20, 8'h00, 16'h0002);
+    check(dut.host_range_mode == 2'b10,
+          "G14.2: Opcode 0x20 -> host_range_mode = 2'b10 (long)");
+
+    // G14.3: Restore range_mode to auto (0x00)
+    bfm_send_cmd(8'h20, 8'h00, 16'h0000);
+    check(dut.host_range_mode == 2'b00,
+          "G14.3: Opcode 0x20 -> host_range_mode = 2'b00 (auto)");
+
+    // --- CFAR Guard Cells (0x21) ---
+    // G14.4: Set guard cells to 4
+    bfm_send_cmd(8'h21, 8'h00, 16'h0004);
+    check(dut.host_cfar_guard == 4'd4,
+          "G14.4: Opcode 0x21 -> host_cfar_guard = 4");
+
+    // G14.5: Set guard cells to 0 (valid edge case)
+    bfm_send_cmd(8'h21, 8'h00, 16'h0000);
+    check(dut.host_cfar_guard == 4'd0,
+          "G14.5: Opcode 0x21 -> host_cfar_guard = 0 (edge case)");
+
+    // --- CFAR Training Cells (0x22) ---
+    // G14.6: Set training cells to 16
+    bfm_send_cmd(8'h22, 8'h00, 16'h0010);
+    check(dut.host_cfar_train == 5'd16,
+          "G14.6: Opcode 0x22 -> host_cfar_train = 16");
+
+    // G14.7: Set training cells to 1 (minimum)
+    bfm_send_cmd(8'h22, 8'h00, 16'h0001);
+    check(dut.host_cfar_train == 5'd1,
+          "G14.7: Opcode 0x22 -> host_cfar_train = 1 (min)");
+
+    // --- CFAR Alpha / Threshold Multiplier (0x23) ---
+    // G14.8: Set alpha to 0x48 (4.5 in Q4.4)
+    bfm_send_cmd(8'h23, 8'h00, 16'h0048);
+    check(dut.host_cfar_alpha == 8'h48,
+          "G14.8: Opcode 0x23 -> host_cfar_alpha = 0x48 (4.5 Q4.4)");
+
+    // G14.9: Set alpha to 0x10 (1.0 in Q4.4)
+    bfm_send_cmd(8'h23, 8'h00, 16'h0010);
+    check(dut.host_cfar_alpha == 8'h10,
+          "G14.9: Opcode 0x23 -> host_cfar_alpha = 0x10 (1.0 Q4.4)");
+
+    // --- CFAR Mode (0x24) ---
+    // G14.10: Set mode to GO-CFAR (0x01)
+    bfm_send_cmd(8'h24, 8'h00, 16'h0001);
+    check(dut.host_cfar_mode == 2'b01,
+          "G14.10: Opcode 0x24 -> host_cfar_mode = 2'b01 (GO-CFAR)");
+
+    // G14.11: Set mode to SO-CFAR (0x02)
+    bfm_send_cmd(8'h24, 8'h00, 16'h0002);
+    check(dut.host_cfar_mode == 2'b10,
+          "G14.11: Opcode 0x24 -> host_cfar_mode = 2'b10 (SO-CFAR)");
+
+    // --- CFAR Enable (0x25) ---
+    // G14.12: Enable CFAR
+    bfm_send_cmd(8'h25, 8'h00, 16'h0001);
+    check(dut.host_cfar_enable == 1'b1,
+          "G14.12: Opcode 0x25 -> host_cfar_enable = 1 (CFAR active)");
+
+    // G14.13: Disable CFAR (restore default)
+    bfm_send_cmd(8'h25, 8'h00, 16'h0000);
+    check(dut.host_cfar_enable == 1'b0,
+          "G14.13: Opcode 0x25 -> host_cfar_enable = 0 (simple threshold)");
+
+    // Restore CFAR registers to safe defaults for remainder of sim
+    bfm_send_cmd(8'h21, 8'h00, 16'h0002);  // guard=2
+    bfm_send_cmd(8'h22, 8'h00, 16'h0008);  // train=8
+    bfm_send_cmd(8'h23, 8'h00, 16'h0030);  // alpha=3.0
+    bfm_send_cmd(8'h24, 8'h00, 16'h0000);  // mode=CA
+    bfm_send_cmd(8'h25, 8'h00, 16'h0000);  // enable=0
 
     $display("");
 

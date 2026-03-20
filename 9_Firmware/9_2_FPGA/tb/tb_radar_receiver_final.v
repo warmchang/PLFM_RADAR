@@ -152,7 +152,9 @@ radar_receiver_final dut (
     .host_chirps_per_elev(6'd32),
 
     // Fix 3: digital gain control — pass-through for golden reference
-    .host_gain_shift(4'd0)
+    .host_gain_shift(4'd0),
+    // CFAR: frame-complete output (not used in this TB)
+    .doppler_frame_done_out()
 );
 
 // ============================================================================

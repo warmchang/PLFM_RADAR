@@ -164,6 +164,9 @@ wire rx_doppler_data_valid;
 reg rx_detect_flag;       // Threshold detection result (was rx_cfar_detection)
 reg rx_detect_valid;      // Detection valid pulse (was rx_cfar_valid)
 
+// Frame-complete signal from Doppler processor (for CFAR)
+wire rx_frame_complete;
+
 // Data packing for USB
 wire [31:0] usb_range_profile;
 wire usb_range_valid;
@@ -223,6 +226,13 @@ reg        chirps_mismatch_error;     // Set if host tried to set chirps != FFT 
 //   2'b11 = Reserved
 // Currently a configuration store only — antenna/timing switching TBD.
 reg [1:0]  host_range_mode;
+
+// CFAR configuration registers (host-configurable via USB)
+reg [3:0]  host_cfar_guard;       // Opcode 0x21: guard cells per side (0..8)
+reg [4:0]  host_cfar_train;       // Opcode 0x22: training cells per side (1..16)
+reg [7:0]  host_cfar_alpha;       // Opcode 0x23: threshold multiplier (Q4.4)
+reg [1:0]  host_cfar_mode;        // Opcode 0x24: 00=CA, 01=GO, 10=SO
+reg        host_cfar_enable;      // Opcode 0x25: 1=CFAR, 0=simple threshold
 
 // ============================================================================
 // CLOCK BUFFERING
@@ -474,7 +484,9 @@ radar_receiver_final rx_inst (
     // (inside radar_mode_controller) handle debouncing/edge detection.
     .stm32_new_chirp_rx(stm32_new_chirp),
     .stm32_new_elevation_rx(stm32_new_elevation),
-    .stm32_new_azimuth_rx(stm32_new_azimuth)
+    .stm32_new_azimuth_rx(stm32_new_azimuth),
+    // CFAR: Doppler frame-complete pulse
+    .doppler_frame_done_out(rx_frame_complete)
 );
 
 // ============================================================================
@@ -488,44 +500,64 @@ assign rx_doppler_imag = rx_doppler_output[31:16];
 assign rx_doppler_data_valid = rx_doppler_valid;
 
 // ============================================================================
-// THRESHOLD DETECTOR (renamed from misleading "CFAR" — this is NOT CFAR)
+// CFAR DETECTOR (replaces simple threshold detector)
 // ============================================================================
-// Simple magnitude threshold: |I|+|Q| > host_detect_threshold
-// This is a placeholder until real CFAR (Gap 1) is implemented.
-//
-// BUG FIXES applied (Build 22):
-//   1. cfar_mag was registered (<=) then compared in same always block,
-//      causing one-cycle-lag: comparison used PREVIOUS sample's magnitude.
-//      FIX: compute magnitude combinationally (wire), compare same cycle.
-//   2. rx_cfar_detection was never cleared on non-detect cycles — stayed
-//      latched high after first detection until system reset.
-//      FIX: clear detection flag every cycle, set only on actual detect.
+// Cell-Averaging CFAR with CA/GO/SO modes. When cfg_cfar_enable=0,
+// falls back to simple magnitude threshold (backward-compatible).
+// See cfar_ca.v for architecture details.
 
-// Combinational magnitude: no pipeline lag
-wire [16:0] detect_mag;
-wire [15:0] detect_abs_i = rx_doppler_real[15] ? (~rx_doppler_real + 16'd1) : rx_doppler_real;
-wire [15:0] detect_abs_q = rx_doppler_imag[15] ? (~rx_doppler_imag + 16'd1) : rx_doppler_imag;
-assign detect_mag = {1'b0, detect_abs_i} + {1'b0, detect_abs_q};
+wire cfar_detect_flag;
+wire cfar_detect_valid;
+wire [5:0]  cfar_detect_range;
+wire [4:0]  cfar_detect_doppler;
+wire [16:0] cfar_detect_magnitude;
+wire [16:0] cfar_detect_threshold;
+wire [15:0] cfar_detect_count;
+wire        cfar_busy_w;
+wire [7:0]  cfar_status_w;
 
-reg [7:0] detect_counter;
+cfar_ca cfar_inst (
+    .clk(clk_100m_buf),
+    .reset_n(sys_reset_n),
+
+    // Doppler processor outputs
+    .doppler_data(rx_doppler_output),
+    .doppler_valid(rx_doppler_valid),
+    .doppler_bin_in(rx_doppler_bin),
+    .range_bin_in(rx_range_bin),
+    .frame_complete(rx_frame_complete),
+
+    // Configuration
+    .cfg_guard_cells(host_cfar_guard),
+    .cfg_train_cells(host_cfar_train),
+    .cfg_alpha(host_cfar_alpha),
+    .cfg_cfar_mode(host_cfar_mode),
+    .cfg_cfar_enable(host_cfar_enable),
+    .cfg_simple_threshold(host_detect_threshold),
+
+    // Detection outputs
+    .detect_flag(cfar_detect_flag),
+    .detect_valid(cfar_detect_valid),
+    .detect_range(cfar_detect_range),
+    .detect_doppler(cfar_detect_doppler),
+    .detect_magnitude(cfar_detect_magnitude),
+    .detect_threshold(cfar_detect_threshold),
+
+    // Status
+    .detect_count(cfar_detect_count),
+    .cfar_busy(cfar_busy_w),
+    .cfar_status(cfar_status_w)
+);
+
+// Connect CFAR outputs to existing detection signals
+// (rx_detect_flag/valid are regs — drive them from CFAR combinationally)
 always @(posedge clk_100m_buf or negedge sys_reset_n) begin
     if (!sys_reset_n) begin
-        detect_counter   <= 8'd0;
-        rx_detect_flag   <= 1'b0;
-        rx_detect_valid  <= 1'b0;
-    end else begin
-        // Default: clear every cycle (fixes sticky detection bug)
         rx_detect_flag  <= 1'b0;
         rx_detect_valid <= 1'b0;
-        
-        if (rx_doppler_valid) begin
-            // Compare combinational magnitude against threshold (same cycle)
-            if (detect_mag > {1'b0, host_detect_threshold}) begin
-                rx_detect_flag  <= 1'b1;
-                rx_detect_valid <= 1'b1;
-                detect_counter  <= detect_counter + 1;
-            end
-        end
+    end else begin
+        rx_detect_flag  <= cfar_detect_flag;
+        rx_detect_valid <= cfar_detect_valid;
     end
 end
 
@@ -665,6 +697,12 @@ always @(posedge clk_100m_buf or negedge sys_reset_n) begin
         host_status_request     <= 1'b0;
         chirps_mismatch_error   <= 1'b0;
         host_range_mode         <= 2'b00;     // Default: auto
+        // CFAR defaults (disabled by default — backward-compatible)
+        host_cfar_guard         <= 4'd2;      // 2 guard cells each side
+        host_cfar_train         <= 5'd8;      // 8 training cells each side
+        host_cfar_alpha         <= 8'h30;     // alpha=3.0 (Q4.4)
+        host_cfar_mode          <= 2'b00;     // CA-CFAR
+        host_cfar_enable        <= 1'b0;      // Disabled (simple threshold)
     end else begin
         host_trigger_pulse <= 1'b0;    // Self-clearing pulse
         host_status_request <= 1'b0;   // Self-clearing pulse
@@ -697,6 +735,12 @@ always @(posedge clk_100m_buf or negedge sys_reset_n) begin
                 end
                 8'h16: host_gain_shift         <= usb_cmd_value[3:0];  // Fix 3: digital gain
                 8'h20: host_range_mode         <= usb_cmd_value[1:0];  // Fix 7: range mode
+                // CFAR configuration opcodes
+                8'h21: host_cfar_guard         <= usb_cmd_value[3:0];
+                8'h22: host_cfar_train         <= usb_cmd_value[4:0];
+                8'h23: host_cfar_alpha         <= usb_cmd_value[7:0];
+                8'h24: host_cfar_mode          <= usb_cmd_value[1:0];
+                8'h25: host_cfar_enable        <= usb_cmd_value[0];
                 8'hFF: host_status_request     <= 1'b1;  // Gap 2: status readback
                 default: ;
             endcase

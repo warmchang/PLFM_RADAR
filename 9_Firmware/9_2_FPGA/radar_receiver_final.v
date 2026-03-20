@@ -48,7 +48,10 @@ module radar_receiver_final (
     // these to synchronize receiver processing with STM32-timed chirps.
     input wire stm32_new_chirp_rx,
     input wire stm32_new_elevation_rx,
-    input wire stm32_new_azimuth_rx
+    input wire stm32_new_azimuth_rx,
+
+    // CFAR integration: expose Doppler frame_complete to top level
+    output wire doppler_frame_done_out
 );
 
 // ========== INTERNAL SIGNALS ==========
@@ -91,6 +94,7 @@ wire doppler_spectrum_valid;
 wire [4:0] doppler_bin_out;
 wire doppler_processing;
 wire doppler_frame_done;
+assign doppler_frame_done_out = doppler_frame_done;
 
 // ========== RANGE BIN DECIMATOR SIGNALS ==========
 wire signed [15:0] decimated_range_i;
