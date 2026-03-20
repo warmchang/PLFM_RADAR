@@ -760,6 +760,243 @@ def run_doppler_fft(range_data_i, range_data_q, twiddle_file_32=None):
 
 
 # ===========================================================================
+# Stage 3c: MTI Canceller (2-pulse, bit-accurate)
+# ===========================================================================
+def run_mti_canceller(decim_i, decim_q, enable=True):
+    """
+    Bit-accurate model of mti_canceller.v — 2-pulse canceller.
+
+    Input:  decim_i/q — shape (N_chirps, NUM_RANGE_BINS), 16-bit signed
+    Output: mti_i/q   — shape (N_chirps, NUM_RANGE_BINS), 16-bit signed
+
+    When enable=True:
+      - First chirp (chirp 0): output is all zeros (muted, no previous data)
+      - Subsequent chirps: out[c][r] = current[c][r] - previous[c-1][r],
+        with saturation to 16-bit.
+    When enable=False:
+      - Pass-through (output = input).
+
+    RTL detail (from mti_canceller.v):
+      diff_full = {I_in[15], I_in} - {prev[15], prev}  (17-bit signed)
+      saturate to 16-bit: clamp to [-32768, +32767]
+    """
+    n_chirps, n_bins = decim_i.shape
+    mti_i = np.zeros_like(decim_i)
+    mti_q = np.zeros_like(decim_q)
+
+    print(f"[MTI] 2-pulse canceller, enable={enable}, {n_chirps} chirps x {n_bins} bins")
+
+    if not enable:
+        mti_i[:] = decim_i
+        mti_q[:] = decim_q
+        print(f"  Pass-through mode (MTI disabled)")
+        return mti_i, mti_q
+
+    for c in range(n_chirps):
+        if c == 0:
+            # First chirp: output muted (zeros) — no previous data
+            mti_i[c, :] = 0
+            mti_q[c, :] = 0
+        else:
+            for r in range(n_bins):
+                # Sign-extend to 17-bit, subtract, saturate back to 16-bit
+                diff_i = int(decim_i[c, r]) - int(decim_i[c - 1, r])
+                diff_q = int(decim_q[c, r]) - int(decim_q[c - 1, r])
+                mti_i[c, r] = saturate(diff_i, 16)
+                mti_q[c, r] = saturate(diff_q, 16)
+
+    print(f"  Chirp 0: muted (zeros)")
+    print(f"  Chirps 1-{n_chirps-1}: I range [{mti_i[1:].min()}, {mti_i[1:].max()}], "
+          f"Q range [{mti_q[1:].min()}, {mti_q[1:].max()}]")
+    return mti_i, mti_q
+
+
+# ===========================================================================
+# Stage 3d: DC Notch Filter (post-Doppler, bit-accurate)
+# ===========================================================================
+def run_dc_notch(doppler_i, doppler_q, width=2):
+    """
+    Bit-accurate model of the inline DC notch filter in radar_system_top.v.
+
+    Input:  doppler_i/q — shape (NUM_RANGE_BINS, NUM_DOPPLER_BINS), 16-bit signed
+    Output: notched_i/q — shape (NUM_RANGE_BINS, NUM_DOPPLER_BINS), 16-bit signed
+
+    Zeros Doppler bins within ±width of DC (bin 0).
+    In a 32-point FFT, DC is bin 0; negative Doppler wraps to bins 31,30,...
+      width=0: pass-through
+      width=1: zero bins {0}
+      width=2: zero bins {0, 1, 31}
+      width=3: zero bins {0, 1, 2, 30, 31}  etc.
+
+    RTL logic (from radar_system_top.v lines 517-524):
+      dc_notch_active = (width != 0) &&
+                        (dop_bin < width || dop_bin > (31 - width + 1))
+      notched_data = dc_notch_active ? 0 : doppler_data
+    """
+    n_range, n_doppler = doppler_i.shape
+    notched_i = doppler_i.copy()
+    notched_q = doppler_q.copy()
+
+    print(f"[DC NOTCH] width={width}, {n_range} range bins x {n_doppler} Doppler bins")
+
+    if width == 0:
+        print(f"  Pass-through (width=0)")
+        return notched_i, notched_q
+
+    zeroed_count = 0
+    for dbin in range(n_doppler):
+        # Replicate RTL comparison (unsigned 5-bit):
+        #   dop_bin < width  OR  dop_bin > (31 - width + 1)
+        active = (dbin < width) or (dbin > (31 - width + 1))
+        if active:
+            notched_i[:, dbin] = 0
+            notched_q[:, dbin] = 0
+            zeroed_count += 1
+
+    print(f"  Zeroed {zeroed_count} Doppler bin columns")
+    return notched_i, notched_q
+
+
+# ===========================================================================
+# Stage 3e: CA-CFAR Detector (bit-accurate)
+# ===========================================================================
+def run_cfar_ca(doppler_i, doppler_q, guard=2, train=8,
+                alpha_q44=0x30, mode='CA', simple_threshold=500):
+    """
+    Bit-accurate model of cfar_ca.v — Cell-Averaging CFAR detector.
+
+    Input:  doppler_i/q — shape (NUM_RANGE_BINS, NUM_DOPPLER_BINS), 16-bit signed
+    Output: detect_flags — shape (NUM_RANGE_BINS, NUM_DOPPLER_BINS), bool
+            magnitudes   — shape (NUM_RANGE_BINS, NUM_DOPPLER_BINS), uint17
+            thresholds   — shape (NUM_RANGE_BINS, NUM_DOPPLER_BINS), uint17
+
+    CFAR algorithm per Doppler column:
+      1. Compute magnitude |I| + |Q| for all range bins in that column
+      2. For each CUT (Cell Under Test) at range index k:
+         a. Leading training cells: indices [k-G-T .. k-G-1] (clamped to valid)
+         b. Lagging training cells: indices [k+G+1 .. k+G+T] (clamped to valid)
+         c. noise_sum = sum of training cells (CA mode: both sides)
+         d. threshold = (alpha * noise_sum) >> 4  (Q4.4 shift)
+         e. detect if magnitude[k] > threshold
+
+    RTL details (from cfar_ca.v):
+      - Magnitude: |I| + |Q| (L1 norm, 17-bit unsigned)
+      - Alpha in Q4.4 fixed-point (8-bit unsigned)
+      - ALPHA_FRAC_BITS = 4
+      - Threshold saturates to 17 bits
+      - Edge handling: uses only available training cells at boundaries
+      - Pipeline: ST_CFAR_THR → ST_CFAR_MUL → ST_CFAR_CMP
+
+    Modes:
+      CA: noise_sum = leading_sum + lagging_sum
+      GO: noise_sum = side with greater average (cross-multiply comparison)
+      SO: noise_sum = side with smaller average
+    """
+    n_range, n_doppler = doppler_i.shape
+    ALPHA_FRAC_BITS = 4
+
+    # Ensure train >= 1 (RTL clamps 0 → 1)
+    if train == 0:
+        train = 1
+
+    print(f"[CFAR] mode={mode}, guard={guard}, train={train}, "
+          f"alpha=0x{alpha_q44:02X} (Q4.4={alpha_q44/16:.2f}), "
+          f"{n_range} range x {n_doppler} Doppler")
+
+    # Compute magnitudes: |I| + |Q| (17-bit unsigned, matching RTL L1 norm)
+    # RTL: abs_i = I[15] ? (~I + 1) : I; abs_q = Q[15] ? (~Q + 1) : Q
+    # For I = -32768: ~(-32768 as 16-bit) + 1 = 32768 (unsigned)
+    magnitudes = np.zeros((n_range, n_doppler), dtype=np.int64)
+    for rbin in range(n_range):
+        for dbin in range(n_doppler):
+            i_val = int(doppler_i[rbin, dbin])
+            q_val = int(doppler_q[rbin, dbin])
+            abs_i = (-i_val) & 0xFFFF if i_val < 0 else i_val & 0xFFFF
+            abs_q = (-q_val) & 0xFFFF if q_val < 0 else q_val & 0xFFFF
+            magnitudes[rbin, dbin] = abs_i + abs_q  # 17-bit unsigned
+
+    detect_flags = np.zeros((n_range, n_doppler), dtype=np.bool_)
+    thresholds = np.zeros((n_range, n_doppler), dtype=np.int64)
+
+    total_detections = 0
+
+    # Process each Doppler column independently (matching RTL column-by-column)
+    for dbin in range(n_doppler):
+        col = magnitudes[:, dbin]  # 64 magnitudes for this Doppler bin
+
+        for cut_idx in range(n_range):
+            # Compute leading sum (cells before CUT, outside guard zone)
+            leading_sum = 0
+            leading_count = 0
+            for t in range(1, train + 1):
+                idx = cut_idx - guard - t
+                if 0 <= idx < n_range:
+                    leading_sum += int(col[idx])
+                    leading_count += 1
+
+            # Compute lagging sum (cells after CUT, outside guard zone)
+            lagging_sum = 0
+            lagging_count = 0
+            for t in range(1, train + 1):
+                idx = cut_idx + guard + t
+                if 0 <= idx < n_range:
+                    lagging_sum += int(col[idx])
+                    lagging_count += 1
+
+            # Mode-dependent noise estimate
+            if mode == 'CA' or mode == 'CA-CFAR':
+                noise_sum = leading_sum + lagging_sum
+            elif mode == 'GO' or mode == 'GO-CFAR':
+                if leading_count > 0 and lagging_count > 0:
+                    if leading_sum * lagging_count > lagging_sum * leading_count:
+                        noise_sum = leading_sum
+                    else:
+                        noise_sum = lagging_sum
+                elif leading_count > 0:
+                    noise_sum = leading_sum
+                else:
+                    noise_sum = lagging_sum
+            elif mode == 'SO' or mode == 'SO-CFAR':
+                if leading_count > 0 and lagging_count > 0:
+                    if leading_sum * lagging_count < lagging_sum * leading_count:
+                        noise_sum = leading_sum
+                    else:
+                        noise_sum = lagging_sum
+                elif leading_count > 0:
+                    noise_sum = leading_sum
+                else:
+                    noise_sum = lagging_sum
+            else:
+                noise_sum = leading_sum + lagging_sum  # Default to CA
+
+            # Threshold = (alpha * noise_sum) >> ALPHA_FRAC_BITS
+            # RTL: noise_product = r_alpha * noise_sum_reg (31-bit)
+            #      threshold = noise_product[ALPHA_FRAC_BITS +: MAG_WIDTH]
+            #      saturate if overflow
+            noise_product = alpha_q44 * noise_sum
+            threshold_raw = noise_product >> ALPHA_FRAC_BITS
+
+            # Saturate to MAG_WIDTH=17 bits
+            MAX_MAG = (1 << 17) - 1  # 131071
+            if threshold_raw > MAX_MAG:
+                threshold_val = MAX_MAG
+            else:
+                threshold_val = int(threshold_raw)
+
+            # Detection: magnitude > threshold
+            if int(col[cut_idx]) > threshold_val:
+                detect_flags[cut_idx, dbin] = True
+                total_detections += 1
+
+            thresholds[cut_idx, dbin] = threshold_val
+
+    print(f"  Total detections: {total_detections}")
+    print(f"  Magnitude range: [{magnitudes.min()}, {magnitudes.max()}]")
+
+    return detect_flags, magnitudes, thresholds
+
+
+# ===========================================================================
 # Stage 4: Detection (magnitude threshold)
 # ===========================================================================
 def run_detection(doppler_i, doppler_q, threshold=10000):
@@ -1060,6 +1297,105 @@ def main():
     np.save(os.path.join(output_dir, "fullchain_doppler_i.npy"), fc_doppler_i)
     np.save(os.path.join(output_dir, "fullchain_doppler_q.npy"), fc_doppler_q)
     
+    # -----------------------------------------------------------------------
+    # Full-chain with MTI + DC Notch + CFAR
+    # This models the complete RTL data flow:
+    #   range FFT → decimator → MTI canceller → Doppler → DC notch → CFAR
+    # -----------------------------------------------------------------------
+    print(f"\n{'=' * 72}")
+    print("Stage 3c: MTI Canceller (2-pulse, on decimated data)")
+    mti_i, mti_q = run_mti_canceller(decim_i, decim_q, enable=True)
+    write_hex_files(output_dir, mti_i, mti_q, "fullchain_mti_ref")
+    np.save(os.path.join(output_dir, "fullchain_mti_i.npy"), mti_i)
+    np.save(os.path.join(output_dir, "fullchain_mti_q.npy"), mti_q)
+    
+    # Doppler on MTI-filtered data
+    print(f"\n{'=' * 72}")
+    print("Stage 3b+c: Doppler FFT on MTI-filtered decimated data")
+    mti_doppler_i, mti_doppler_q = run_doppler_fft(
+        mti_i, mti_q, twiddle_file_32=twiddle_32
+    )
+    write_hex_files(output_dir, mti_doppler_i, mti_doppler_q, "fullchain_mti_doppler_ref")
+    np.save(os.path.join(output_dir, "fullchain_mti_doppler_i.npy"), mti_doppler_i)
+    np.save(os.path.join(output_dir, "fullchain_mti_doppler_q.npy"), mti_doppler_q)
+    
+    # DC notch on MTI-Doppler data
+    DC_NOTCH_WIDTH = 2  # Default test value: zero bins {0, 1, 31}
+    print(f"\n{'=' * 72}")
+    print(f"Stage 3d: DC Notch Filter (width={DC_NOTCH_WIDTH})")
+    notched_i, notched_q = run_dc_notch(mti_doppler_i, mti_doppler_q, width=DC_NOTCH_WIDTH)
+    write_hex_files(output_dir, notched_i, notched_q, "fullchain_notched_ref")
+    
+    # Write notched Doppler as packed 32-bit for RTL comparison
+    fc_notched_packed_file = os.path.join(output_dir, "fullchain_notched_ref_packed.hex")
+    with open(fc_notched_packed_file, 'w') as f:
+        for rbin in range(DOPPLER_RANGE_BINS):
+            for dbin in range(DOPPLER_FFT_SIZE):
+                i_val = int(notched_i[rbin, dbin]) & 0xFFFF
+                q_val = int(notched_q[rbin, dbin]) & 0xFFFF
+                packed = (q_val << 16) | i_val
+                f.write(f"{packed:08X}\n")
+    print(f"  Wrote {fc_notched_packed_file} ({DOPPLER_RANGE_BINS * DOPPLER_FFT_SIZE} packed IQ words)")
+    
+    # CFAR on DC-notched data
+    CFAR_GUARD = 2
+    CFAR_TRAIN = 8
+    CFAR_ALPHA = 0x30  # Q4.4 = 3.0
+    CFAR_MODE = 'CA'
+    print(f"\n{'=' * 72}")
+    print(f"Stage 3e: CA-CFAR (guard={CFAR_GUARD}, train={CFAR_TRAIN}, alpha=0x{CFAR_ALPHA:02X})")
+    cfar_flags, cfar_mag, cfar_thr = run_cfar_ca(
+        notched_i, notched_q,
+        guard=CFAR_GUARD, train=CFAR_TRAIN,
+        alpha_q44=CFAR_ALPHA, mode=CFAR_MODE
+    )
+    
+    # Write CFAR reference files
+    # 1. Magnitude map (17-bit unsigned, row-major: 64 range x 32 Doppler = 2048)
+    cfar_mag_file = os.path.join(output_dir, "fullchain_cfar_mag.hex")
+    with open(cfar_mag_file, 'w') as f:
+        for rbin in range(DOPPLER_RANGE_BINS):
+            for dbin in range(DOPPLER_FFT_SIZE):
+                m = int(cfar_mag[rbin, dbin]) & 0x1FFFF
+                f.write(f"{m:05X}\n")
+    print(f"  Wrote {cfar_mag_file} ({DOPPLER_RANGE_BINS * DOPPLER_FFT_SIZE} mag values)")
+    
+    # 2. Threshold map (17-bit unsigned)
+    cfar_thr_file = os.path.join(output_dir, "fullchain_cfar_thr.hex")
+    with open(cfar_thr_file, 'w') as f:
+        for rbin in range(DOPPLER_RANGE_BINS):
+            for dbin in range(DOPPLER_FFT_SIZE):
+                t = int(cfar_thr[rbin, dbin]) & 0x1FFFF
+                f.write(f"{t:05X}\n")
+    print(f"  Wrote {cfar_thr_file} ({DOPPLER_RANGE_BINS * DOPPLER_FFT_SIZE} threshold values)")
+    
+    # 3. Detection flags (1-bit per cell)
+    cfar_det_file = os.path.join(output_dir, "fullchain_cfar_det.hex")
+    with open(cfar_det_file, 'w') as f:
+        for rbin in range(DOPPLER_RANGE_BINS):
+            for dbin in range(DOPPLER_FFT_SIZE):
+                d = 1 if cfar_flags[rbin, dbin] else 0
+                f.write(f"{d:01X}\n")
+    print(f"  Wrote {cfar_det_file} ({DOPPLER_RANGE_BINS * DOPPLER_FFT_SIZE} detection flags)")
+    
+    # 4. Detection list (text)
+    cfar_detections = np.argwhere(cfar_flags)
+    cfar_det_list_file = os.path.join(output_dir, "fullchain_cfar_detections.txt")
+    with open(cfar_det_list_file, 'w') as f:
+        f.write(f"# AERIS-10 Full-Chain CFAR Detection List\n")
+        f.write(f"# Chain: decim -> MTI -> Doppler -> DC notch(w={DC_NOTCH_WIDTH}) -> CA-CFAR\n")
+        f.write(f"# CFAR: guard={CFAR_GUARD}, train={CFAR_TRAIN}, alpha=0x{CFAR_ALPHA:02X}, mode={CFAR_MODE}\n")
+        f.write(f"# Format: range_bin doppler_bin magnitude threshold\n")
+        for det in cfar_detections:
+            r, d = det
+            f.write(f"{r} {d} {cfar_mag[r, d]} {cfar_thr[r, d]}\n")
+    print(f"  Wrote {cfar_det_list_file} ({len(cfar_detections)} detections)")
+    
+    # Save numpy arrays
+    np.save(os.path.join(output_dir, "fullchain_cfar_mag.npy"), cfar_mag)
+    np.save(os.path.join(output_dir, "fullchain_cfar_thr.npy"), cfar_thr)
+    np.save(os.path.join(output_dir, "fullchain_cfar_flags.npy"), cfar_flags)
+    
     # Run detection on full-chain Doppler map
     print(f"\n{'=' * 72}")
     print("Stage 4: Detection on full-chain Doppler map")
@@ -1148,6 +1484,8 @@ def main():
     print(f"  Detections (direct): {len(detections)} (threshold={args.threshold})")
     print(f"  Full-chain decimator: 1024→64 peak detection")
     print(f"  Full-chain detections: {len(fc_detections)} (threshold={args.threshold})")
+    print(f"  MTI+CFAR chain: decim → MTI → Doppler → DC notch(w={DC_NOTCH_WIDTH}) → CA-CFAR")
+    print(f"  CFAR detections: {len(cfar_detections)} (guard={CFAR_GUARD}, train={CFAR_TRAIN}, alpha=0x{CFAR_ALPHA:02X})")
     print(f"  Hex stimulus files: {output_dir}/")
     print(f"  Ready for RTL co-simulation with Icarus Verilog")
     
