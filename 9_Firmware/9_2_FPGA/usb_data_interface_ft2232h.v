@@ -225,6 +225,7 @@ reg cfar_data_pending;
 // Status snapshot (ft_clk domain)
 reg [31:0] status_words [0:5];
 
+integer si;  // status_words loop index
 always @(posedge ft_clk or negedge ft_reset_n) begin
     if (!ft_reset_n) begin
         range_toggle_sync   <= 3'b000;
@@ -242,6 +243,9 @@ always @(posedge ft_clk or negedge ft_reset_n) begin
         // Default to range-only on reset (prevents write FSM deadlock)
         stream_ctrl_sync_0  <= 3'b001;
         stream_ctrl_sync_1  <= 3'b001;
+        // Explicit reset for status_words to avoid Synth 8-7137
+        for (si = 0; si < 6; si = si + 1)
+            status_words[si] <= 32'd0;
     end else begin
         // 3-stage toggle synchronizers
         range_toggle_sync   <= {range_toggle_sync[1:0],   range_valid_toggle};
