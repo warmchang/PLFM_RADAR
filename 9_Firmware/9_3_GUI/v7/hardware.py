@@ -13,9 +13,10 @@ and 'SET'...'END' binary settings protocol has been removed — it was
 incompatible with the FPGA register interface.
 """
 
-import sys
-import os
+import importlib.util
 import logging
+import pathlib
+import sys
 from typing import ClassVar
 
 from .models import USB_AVAILABLE
@@ -24,18 +25,31 @@ if USB_AVAILABLE:
     import usb.core
     import usb.util
 
-# Import production protocol layer — single source of truth for FPGA comms
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from radar_protocol import (  # noqa: F401 — re-exported for v7 package
-    FT2232HConnection,
-    ReplayConnection,
-    RadarProtocol,
-    Opcode,
-    RadarAcquisition,
-    RadarFrame,
-    StatusResponse,
-    DataRecorder,
-)
+
+def _load_radar_protocol():
+    """Load radar_protocol.py by absolute path without mutating sys.path."""
+    mod_name = "radar_protocol"
+    if mod_name in sys.modules:
+        return sys.modules[mod_name]
+    proto_path = pathlib.Path(__file__).resolve().parent.parent / "radar_protocol.py"
+    spec = importlib.util.spec_from_file_location(mod_name, proto_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
+
+
+_rp = _load_radar_protocol()
+
+# Re-exported for the v7 package — single source of truth for FPGA comms
+FT2232HConnection = _rp.FT2232HConnection
+ReplayConnection = _rp.ReplayConnection
+RadarProtocol = _rp.RadarProtocol
+Opcode = _rp.Opcode
+RadarAcquisition = _rp.RadarAcquisition
+RadarFrame = _rp.RadarFrame
+StatusResponse = _rp.StatusResponse
+DataRecorder = _rp.DataRecorder
 
 logger = logging.getLogger(__name__)
 

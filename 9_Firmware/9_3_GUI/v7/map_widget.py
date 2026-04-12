@@ -64,7 +64,7 @@ class MapBridge(QObject):
 
     @pyqtSlot(str)
     def logFromJS(self, message: str):
-        logger.info(f"[JS] {message}")
+        logger.debug(f"[JS] {message}")
 
     @property
     def is_ready(self) -> bool:
@@ -578,10 +578,7 @@ document.addEventListener('DOMContentLoaded', function() {{
             return
         data = [t.to_dict() for t in targets]
         js_payload = json.dumps(data).replace("\\", "\\\\").replace("'", "\\'")
-        logger.info(
-            "set_targets: %d targets, JSON len=%d, first 200 chars: %s",
-            len(targets), len(js_payload), js_payload[:200],
-        )
+        logger.debug("set_targets: %d targets", len(targets))
         self._status_label.setText(f"{len(targets)} targets tracked")
         self._run_js(f"updateTargets('{js_payload}')")
 
