@@ -49,3 +49,5 @@ select = [
 "**/test_*.py" = ["ARG", "T20", "ERA"]
 # Re-export modules: unused imports are intentional
 "**/v7/hardware.py" = ["F401"]
+# CLI tool: print() is the intentional output mechanism
+"**/uart_capture.py" = ["T20"]

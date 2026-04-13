@@ -94,9 +94,12 @@ def list_ports():
     """Print available serial ports."""
     ports = serial.tools.list_ports.comports()
     if not ports:
+        print("No serial ports found.")
         return
-    for _p in sorted(ports, key=lambda x: x.device):
-        pass
+    print(f"{'Port':<30} {'Description':<40} {'HWID'}")
+    print("-" * 100)
+    for p in sorted(ports, key=lambda x: x.device):
+        print(f"{p.device:<30} {p.description:<40} {p.hwid}")
 
 
 def auto_detect_port():
@@ -224,7 +227,7 @@ class CaptureStats:
 # Main capture loop
 # ---------------------------------------------------------------------------
 
-def capture(port, baud, log_file, filter_subsys, errors_only, _use_color):
+def capture(port, baud, log_file, filter_subsys, errors_only, use_color):
     """Open serial port and capture DIAG output."""
     stats = CaptureStats()
     running = True
@@ -248,12 +251,14 @@ def capture(port, baud, log_file, filter_subsys, errors_only, _use_color):
     except serial.SerialException:
         sys.exit(1)
 
+    print(f"Connected to {port} at {baud} baud")
     if log_file:
-        pass
+        print(f"Logging to {log_file}")
     if filter_subsys:
-        pass
+        print(f"Filter: {', '.join(sorted(filter_subsys))}")
     if errors_only:
-        pass
+        print("Mode: errors/warnings only")
+    print("Press Ctrl-C to stop.\n")
 
     if log_file:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
@@ -300,13 +305,15 @@ def capture(port, baud, log_file, filter_subsys, errors_only, _use_color):
 
                     # Terminal display respects filters
                     if should_display(line, filter_subsys, errors_only):
-                        pass
+                        sys.stdout.write(colorize(line, use_color) + "\n")
+                        sys.stdout.flush()
 
             if flog:
                 flog.write(f"\n{stats.summary()}\n")
 
     finally:
         ser.close()
+        print(stats.summary())
 
 
 # ---------------------------------------------------------------------------
