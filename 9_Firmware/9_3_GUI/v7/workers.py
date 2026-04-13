@@ -131,6 +131,10 @@ class RadarDataWorker(QThread):
         self._byte_count = 0
         self._error_count = 0
 
+        # Monotonically increasing target ID — persisted across frames so map
+        # JS can key markers/trails by a stable ID.
+        self._next_target_id = 0
+
     def stop(self):
         self._running = False
         if self._acquisition:
@@ -244,7 +248,7 @@ class RadarDataWorker(QThread):
                 )
 
             target = RadarTarget(
-                id=len(targets),
+                id=self._next_target_id,
                 range=range_m,
                 velocity=velocity_ms,
                 azimuth=azimuth,
@@ -254,6 +258,7 @@ class RadarDataWorker(QThread):
                 snr=snr,
                 timestamp=frame.timestamp,
             )
+            self._next_target_id += 1
             targets.append(target)
 
         # DBSCAN clustering

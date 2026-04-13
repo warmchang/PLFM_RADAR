@@ -32,10 +32,23 @@ def _load_radar_protocol():
     if mod_name in sys.modules:
         return sys.modules[mod_name]
     proto_path = pathlib.Path(__file__).resolve().parent.parent / "radar_protocol.py"
+    if not proto_path.is_file():
+        raise FileNotFoundError(
+            f"radar_protocol.py not found at expected location: {proto_path}"
+        )
     spec = importlib.util.spec_from_file_location(mod_name, proto_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(
+            f"Cannot create module spec for radar_protocol.py at {proto_path}"
+        )
     mod = importlib.util.module_from_spec(spec)
+    # Register before exec so cyclic imports resolve correctly, but remove on failure
     sys.modules[mod_name] = mod
-    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
     return mod
 
 
